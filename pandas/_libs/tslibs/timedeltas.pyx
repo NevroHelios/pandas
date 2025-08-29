@@ -17,6 +17,7 @@ from cpython.object cimport (
 )
 
 import numpy as np
+import pyarrow as pa
 
 cimport numpy as cnp
 from numpy cimport (
@@ -2311,8 +2312,8 @@ class Timedelta(_Timedelta):
                 # see also: item_from_zerodim
                 item = cnp.PyArray_ToScalar(cnp.PyArray_DATA(other), other)
                 return self.__mul__(item)
-            return other * self.to_timedelta64()
-
+            result = other * self.to_timedelta64()
+            return type(self)(pa.array(result))
         return NotImplemented
 
     __rmul__ = __mul__
@@ -2323,6 +2324,8 @@ class Timedelta(_Timedelta):
             other = Timedelta(other)
             if other is NaT:
                 return np.nan
+            if other._value == 0:
+                return NaT # np.NaT attribute error
             if other._creso != self._creso:
                 self, other = self._maybe_cast_to_matching_resos(other)
             return self._value/ float(other._value)
@@ -2337,6 +2340,9 @@ class Timedelta(_Timedelta):
                 other = int(other)
             if isinstance(other, cnp.floating):
                 other = float(other)
+            if isinstance(other, Timedelta): # ratio
+                return self._value / other._value 
+            # scaling
             return Timedelta._from_value_and_reso(
                 <int64_t>(self._value/ other), self._creso
             )
@@ -2346,7 +2352,8 @@ class Timedelta(_Timedelta):
                 # see also: item_from_zerodim
                 item = cnp.PyArray_ToScalar(cnp.PyArray_DATA(other), other)
                 return self.__truediv__(item)
-            return self.to_timedelta64() / other
+            result = self.to_timedelta64() / other
+            return type(self)(pa.array(result))
 
         return NotImplemented
 
@@ -2372,8 +2379,8 @@ class Timedelta(_Timedelta):
             # TODO: if other.dtype.kind == "m" and other.dtype != self.asm8.dtype
             #  then should disallow for consistency with scalar behavior; requires
             #  deprecation cycle. (or changing scalar behavior)
-            return other / self.to_timedelta64()
-
+            result = other / self.to_timedelta64()
+            return type(self)(pa.array(result))
         return NotImplemented
 
     def __floordiv__(self, other):
@@ -2426,7 +2433,7 @@ class Timedelta(_Timedelta):
                     return self // other.item()
                 else:
                     return self.to_timedelta64() // other
-
+                    
             raise TypeError(f"Invalid dtype {other.dtype} for __floordiv__")
 
         return NotImplemented

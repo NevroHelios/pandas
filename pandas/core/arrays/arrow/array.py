@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import math
 import operator
 import re
 import textwrap
@@ -16,6 +17,7 @@ import unicodedata
 import warnings
 
 import numpy as np
+import pandas as pd
 
 from pandas._libs import lib
 from pandas._libs.tslibs import (
@@ -23,6 +25,7 @@ from pandas._libs.tslibs import (
     Timestamp,
     timezones,
 )
+from sqlalchemy import values
 from pandas.compat import (
     HAS_PYARROW,
     pa_version_under12p1,
@@ -401,16 +404,26 @@ class ArrowExtensionArray(
         if len(values) == 0:
             # Retain our dtype
             return self[:0].copy()
-
+        if not isinstance(self.dtype, ArrowDtype):
+            return super()._cast_pointwise_result(values)
+        
         try:
-            arr = pa.array(values, from_pandas=True)
+            if (
+            isinstance(values, (np.ndarray, list, tuple))
+            and np.asarray(values).dtype == np.bool_
+            ):
+                arr = pa.array(values, from_pandas=True)
+            else:
+                arr = pa.array(values, type=self._pa_array.type, from_pandas=True)
         except (ValueError, TypeError):
             # e.g. test_by_column_values_with_same_starting_value with nested
             #  values, one entry of which is an ArrowStringArray
             #  or test_agg_lambda_complex128_dtype_conversion for complex values
             return super()._cast_pointwise_result(values)
-
-        if pa.types.is_duration(arr.type):
+        if pa.types.is_duration(self._pa_array.type) and pa.types.is_floating(arr.type):
+            # just return a numpy array / float Series
+            return np.asarray(values, dtype="float64")
+        elif pa.types.is_duration(arr.type):
             # workaround for https://github.com/apache/arrow/issues/40620
             result = ArrowExtensionArray._from_sequence(values)
             if pa.types.is_duration(self._pa_array.type):
@@ -431,28 +444,79 @@ class ArrowExtensionArray(
                 dtype = ArrowDtype(pa.duration("s"))
                 result = result.astype(dtype)  # type: ignore[assignment]
             return result
-
+    
+        elif pa.types.is_timestamp(arr.type) and pa.types.is_timestamp(self.dtype.pyarrow_dtype):
+            # Preserve the original array's timestamp unit (i.e. us/ns/...)
+            original_unit = self.dtype.pyarrow_dtype.unit
+            tz = arr.type.tz
+        
+            # Only convert if units don't match
+            if arr.type.unit != original_unit:
+                target_pa_dtype = pa.timestamp(original_unit, tz=tz)
+                arr = arr.cast(target_pa_dtype)
+        
+            # Create ArrowExtensionArray with the processed array
+            return self._from_pyarrow_array(arr)
+        elif pa.types.is_floating(self._pa_array.type):
+            try:
+                if self._pa_array.type == pa.float32():
+                    coerced = [
+                        None if (v is None or v is pd.NA or (isinstance(v, float) and np.isnan(v)))
+                        else np.float32(v)
+                        for v in values
+                    ]
+                    arr = pa.array(coerced, type=pa.float32(), from_pandas=True)
+                else:
+                    arr = pa.array(values, type=self._pa_array.type, from_pandas=True)
+            except pa.ArrowInvalid:
+                arr = pa.array(values, from_pandas=True)
         elif pa.types.is_date(arr.type) and pa.types.is_date(self._pa_array.type):
             arr = arr.cast(self._pa_array.type)
         elif pa.types.is_time(arr.type) and pa.types.is_time(self._pa_array.type):
             arr = arr.cast(self._pa_array.type)
         elif pa.types.is_decimal(arr.type) and pa.types.is_decimal(self._pa_array.type):
             arr = arr.cast(self._pa_array.type)
-        elif pa.types.is_integer(arr.type) and pa.types.is_integer(self._pa_array.type):
-            try:
-                arr = arr.cast(self._pa_array.type)
-            except pa.lib.ArrowInvalid:
-                # e.g. test_combine_add if we can't cast
-                pass
-        elif pa.types.is_floating(arr.type) and pa.types.is_floating(
-            self._pa_array.type
+        elif is_numeric_dtype(self.dtype):
+            if pa.types.is_integer(self._pa_array.type):
+                try:
+                    # Handle the case where Python map gives floats (e.g., 1 → 1.0)
+                    floats = [v for v in values if isinstance(v, float) and v is not None]
+                    if floats and all(math.isfinite(v) and v.is_integer() for v in floats):
+                        arr = pa.array([int(v) if isinstance(v, float) else v for v in values],
+                                    type=self._pa_array.type,
+                                    from_pandas=True)
+                        return self._from_pyarrow_array(arr)
+
+                    # Special handling for unsigned integers
+                    if pa.types.is_unsigned_integer(self._pa_array.type):
+                        if any((isinstance(v, (int, np.integer, float)) and v is not None and v < 0)
+                            for v in values):
+                            # Promote to signed int (wider type to hold negatives)
+                            signed_type = pa.int16() if self._pa_array.type == pa.uint8() else pa.int64()
+                            arr = pa.array(values, type=signed_type, from_pandas=True)
+                        else:
+                            arr = pa.array(values, type=self._pa_array.type, from_pandas=True)
+                    else:
+                        arr = pa.array(values, type=self._pa_array.type, from_pandas=True)
+                except (pa.ArrowInvalid, OverflowError):
+                    arr = pa.array(values, from_pandas=True)
+
+        elif (
+            (pa.types.is_integer(arr.type) and pa.types.is_integer(self._pa_array.type))
+            or (pa.types.is_floating(arr.type) and pa.types.is_integer(self._pa_array.type))
         ):
             try:
                 arr = arr.cast(self._pa_array.type)
             except pa.lib.ArrowInvalid:
                 # e.g. test_combine_add if we can't cast
                 pass
-
+        elif pa.types.is_floating(arr.type) and pa.types.is_floating(self._pa_array.type):
+            try:
+                arr = arr.cast(self._pa_array.type)
+            except pa.lib.ArrowInvalid:
+                # e.g. test_combine_add if we can't cast
+                pass
+        
         if isinstance(self.dtype, StringDtype):
             if pa.types.is_string(arr.type) or pa.types.is_large_string(arr.type):
                 # ArrowStringArray preserves dtype.na_value
@@ -462,6 +526,7 @@ class ArrowExtensionArray(
                 #  result instead
                 return super()._cast_pointwise_result(values)
             return ArrowExtensionArray(arr)
+        
         return self._from_pyarrow_array(arr)
 
     @classmethod
@@ -729,15 +794,28 @@ class ArrowExtensionArray(
             return self._from_pyarrow_array(value)
         else:
             pa_type = self._pa_array.type
+            # Special case: timestamp : avoid overflow
+            if pa.types.is_timestamp(pa_type):
+                return pd.Timestamp(value.as_py())  
+            # Special case: duration
+            if pa.types.is_duration(pa_type):
+                return pd.Timedelta(value.as_py())
             scalar = value.as_py()
+
             if scalar is None:
                 return self._dtype.na_value
-            elif pa.types.is_timestamp(pa_type) and pa_type.unit != "ns":
+            elif pa.types.is_timestamp(pa_type):
                 # GH 53326
-                return Timestamp(scalar).as_unit(pa_type.unit)
-            elif pa.types.is_duration(pa_type) and pa_type.unit != "ns":
+                ts = pd.Timestamp(scalar)
+                if pa_type.unit != "ns":
+                    return ts.as_unit(pa_type.unit)
+                return ts
+            elif pa.types.is_duration(pa_type):
                 # GH 53326
-                return Timedelta(scalar).as_unit(pa_type.unit)
+                td = pd.Timedelta(scalar)
+                if pa_type.unit != "ns":
+                    return td.as_unit(pa_type.unit)
+                return td
             else:
                 return scalar
 

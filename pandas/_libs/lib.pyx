@@ -2913,12 +2913,38 @@ def maybe_convert_objects(ndarray[object] objects,
             result[mask] = 1
             result = IntegerArray(result, mask)
         elif result is floats and convert_to_nullable_dtype:
-            from pandas.core.arrays import FloatingArray
+            # Try to preserve integer EAs: if all valid values are integer-like,
+            # downcast to an IntegerArray instead of FloatingArray.
+            cvals = result[~mask]
+            if cvals.size == 0:
+                all_int_like = True
+                saw_negative = False
+            else:
+                all_int_like = np.all(np.isfinite(cvals)) and np.all(cvals == np.trunc(cvals))
+                saw_negative = np.any(cvals < 0)
 
-            # Set these values to 1.0 to be deterministic, match
-            #  FloatingDtype._internal_fill_value
-            result[mask] = 1.0
-            result = FloatingArray(result, mask)
+            if all_int_like:
+                from pandas.core.arrays import IntegerArray
+                # choose signedness from data
+                signed = bool(saw_negative)
+                # choose itemsize: reuse largest seen, else default to 8 bytes
+                itemsize = itemsize_max if itemsize_max > 0 else 8
+                if itemsize not in (1, 2, 4, 8):
+                    itemsize = 8
+                # build dtype code like 'i8' / 'u8'
+                code = ('i' if signed else 'u') + str(itemsize)
+                int_vals = cvals.astype(code, copy=False)
+                vals = np.empty(result.shape, dtype=int_vals.dtype)
+                vals[~mask] = int_vals
+                # match IntegerDtype._internal_fill_value deterministically
+                vals[mask] = 1
+                return IntegerArray(vals, mask)
+            else:
+                from pandas.core.arrays import FloatingArray
+                # Set these values to 1.0 to be deterministic, match
+                #  FloatingDtype._internal_fill_value
+                result[mask] = 1.0
+                result = FloatingArray(result, mask)
 
         if result is uints or result is ints or result is floats or result is complexes:
             # cast to the largest itemsize when all values are NumPy scalars

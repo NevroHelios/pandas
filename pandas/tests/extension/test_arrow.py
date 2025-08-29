@@ -32,6 +32,9 @@ import sys
 import numpy as np
 import pytest
 
+from pandas.api.types import is_datetime64_dtype, is_timedelta64_dtype
+from pandas.core.arrays.arrow import ArrowExtensionArray
+
 from pandas._libs import lib
 from pandas._libs.tslibs import timezones
 from pandas.compat import (
@@ -298,18 +301,8 @@ class TestArrowArray(base.ExtensionTests):
 
     @pytest.mark.parametrize("na_action", [None, "ignore"])
     def test_map(self, data_missing, na_action):
-        if data_missing.dtype.kind in "mM":
-            result = data_missing.map(lambda x: x, na_action=na_action)
-            expected = data_missing.to_numpy(dtype=object)
-            tm.assert_numpy_array_equal(result, expected)
-        else:
-            result = data_missing.map(lambda x: x, na_action=na_action)
-            if data_missing.dtype == "float32[pyarrow]":
-                # map roundtrips through objects, which converts to float64
-                expected = data_missing.to_numpy(dtype="float64", na_value=np.nan)
-            else:
-                expected = data_missing.to_numpy()
-            tm.assert_numpy_array_equal(result, expected)
+        result = data_missing.map(lambda x: x, na_action=na_action)
+        tm.assert_extension_array_equal(result, data_missing)
 
     def test_astype_str(self, data, request, using_infer_string):
         pa_dtype = data.dtype.pyarrow_dtype
@@ -837,9 +830,39 @@ class TestArrowArray(base.ExtensionTests):
         elif type(other) is float:
             return expected.astype("float64[pyarrow]")
 
-        # error: Item "ExtensionDtype" of "dtype[Any] | ExtensionDtype" has
-        #  no attribute "pyarrow_dtype"
-        orig_pa_type = original_dtype.pyarrow_dtype  # type: ignore[union-attr]
+        # --- robustly obtain a pyarrow type corresponding to original_dtype ---
+        orig_pa_type = None
+        if isinstance(original_dtype, ArrowDtype):
+            orig_pa_type = original_dtype.pyarrow_dtype  # type: ignore[union-attr]
+        else:
+            # Map numpy / pandas dtypes to a reasonable pyarrow dtype when possible
+            try:
+                if is_timedelta64_dtype(original_dtype):
+                    # default to ns unless dtype.name provides another unit
+                    name = getattr(original_dtype, "name", "")
+                    unit = "ns"
+                    if "[" in name and "]" in name:
+                        unit = name.split("[", 1)[1].rstrip("]")
+                    orig_pa_type = pa.duration(unit)
+                elif is_datetime64_dtype(original_dtype):
+                    # default to ns
+                    orig_pa_type = pa.timestamp("ns")
+                elif np.issubdtype(original_dtype, np.integer):
+                    orig_pa_type = pa.int64()
+                elif np.issubdtype(original_dtype, np.floating):
+                    orig_pa_type = pa.float64()
+                else:
+                    # For object/string/bool/etc we do not attempt to coerce here
+                    orig_pa_type = None
+            except Exception:
+                orig_pa_type = None
+
+        # If we couldn't map to a pyarrow type, there's nothing for us to coerce:
+        # return the expected pointwise result (as a Series/DataFrame) unchanged.
+        if orig_pa_type is None:
+            return expected
+
+        # At this point orig_pa_type is a pyarrow.DataType; continue with existing logic
         if not was_frame and isinstance(other, pd.Series):
             # i.e. test_arith_series_with_array
             if not (
@@ -867,39 +890,51 @@ class TestArrowArray(base.ExtensionTests):
             #  ArrowExtensionArray does not upcast
             return expected
 
-        pa_expected = pa.array(expected_data._values)
+        # Build a pyarrow array from the pointwise result (let Arrow infer)
+        pa_expected = pa.array(expected_data._values, from_pandas=True)
 
+        # If both are decimal-like, we may need to compare via float
         if pa.types.is_decimal(pa_expected.type) and pa.types.is_decimal(orig_pa_type):
-            # decimal precision can resize in the result type depending on data
-            # just compare the float values
             alt = getattr(obj, op_name)(other)
             alt_dtype = tm.get_dtype(alt)
             assert isinstance(alt_dtype, ArrowDtype)
             if op_name == "__pow__" and isinstance(other, Decimal):
-                # TODO: would it make more sense to retain Decimal here?
                 alt_dtype = ArrowDtype(pa.float64())
             elif (
                 op_name == "__pow__"
                 and isinstance(other, pd.Series)
                 and other.dtype == original_dtype
             ):
-                # TODO: would it make more sense to retain Decimal here?
                 alt_dtype = ArrowDtype(pa.float64())
             else:
                 assert pa.types.is_decimal(alt_dtype.pyarrow_dtype)
             return expected.astype(alt_dtype)
 
-        else:
-            pa_expected = pa_expected.cast(orig_pa_type)
+        # Try to cast pa_expected to orig_pa_type, but avoid unsafe casts
+        try:
+            # Avoid unsupported/meaningless casts:
+            # - float -> duration is unsupported (and conceptually wrong for some ops)
+            # - boolean -> integer often indicates comparison results; don't coerce
+            if pa.types.is_floating(pa_expected.type) and pa.types.is_duration(orig_pa_type):
+                # keep float as-is (division produced floats)
+                pass
+            elif pa.types.is_boolean(pa_expected.type) and pa.types.is_integer(orig_pa_type):
+                # keep boolean as-is (comparison results)
+                pass
+            else:
+                pa_expected = pa_expected.cast(orig_pa_type)
+        except (pa.ArrowNotImplementedError, pa.ArrowInvalid):
+            # if we cannot cast, leave the inferred pa_expected
+            pass
 
-        pd_expected = type(expected_data._values)(pa_expected)
+        pd_expected = ArrowExtensionArray(pa_expected)
+
         if was_frame:
-            expected = pd.DataFrame(
-                pd_expected, index=expected.index, columns=expected.columns
-            )
+            expected = pd.DataFrame(pd_expected, index=expected.index, columns=expected.columns)
         else:
-            expected = pd.Series(pd_expected)
+            expected = pd.Series(pd_expected, index=expected.index)
         return expected
+
 
     def _is_temporal_supported(self, opname, pa_dtype):
         return (

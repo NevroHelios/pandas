@@ -180,21 +180,24 @@ class TestMaskedArrays(base.ExtensionTests):
     @pytest.mark.parametrize("na_action", [None, "ignore"])
     def test_map(self, data_missing, na_action):
         result = data_missing.map(lambda x: x, na_action=na_action)
-        if data_missing.dtype == Float32Dtype():
-            # map roundtrips through objects, which converts to float64
-            expected = data_missing.to_numpy(dtype="float64", na_value=np.nan)
-        else:
-            expected = data_missing.to_numpy()
-        tm.assert_numpy_array_equal(result, expected)
+        expected = data_missing
+        tm.assert_extension_array_equal(result, expected)
 
     def test_map_na_action_ignore(self, data_missing_for_sorting):
         zero = data_missing_for_sorting[2]
         result = data_missing_for_sorting.map(lambda x: zero, na_action="ignore")
+
         if data_missing_for_sorting.dtype.kind == "b":
-            expected = np.array([False, pd.NA, False], dtype=object)
+            expected = pd.array([False, pd.NA, False], dtype="boolean")
         else:
-            expected = np.array([zero, np.nan, zero])
-        tm.assert_numpy_array_equal(result, expected)
+            expected = pd.array([zero, pd.NA, zero], dtype=result.dtype)
+
+        tm.assert_extension_array_equal(result, expected)
+
+
+    def _is_integer(self, dtype):
+        return dtype.kind in [Int8Dtype(), Int16Dtype(), Int32Dtype(), Int64Dtype(),
+                               UInt8Dtype(), UInt16Dtype(), UInt32Dtype(), UInt64Dtype()]
 
     def _get_expected_exception(self, op_name, obj, other):
         try:
@@ -216,15 +219,59 @@ class TestMaskedArrays(base.ExtensionTests):
     def _cast_pointwise_result(self, op_name: str, obj, other, pointwise_result):
         sdtype = tm.get_dtype(obj)
         expected = pointwise_result
-
+        
         if sdtype.kind == "b":
-            if op_name in (
-                "__mod__",
-                "__rmod__",
-            ):
+            if op_name in ("__mod__", "__rmod__"):
                 # combine keeps boolean type
-                expected = expected.astype("Int8")
-
+                if isinstance(expected, pd.DataFrame):
+                    # For DataFrames, apply to each column
+                    expected = expected.astype("Int8")
+                else:
+                    expected = expected.astype("Int8")
+        elif "truediv" in op_name:
+            if sdtype.name in ["Float32", "float32"]:
+                target_dtype = "Float32"
+                numpy_dtype = "float32"
+            else:
+                target_dtype = "Float64" 
+                numpy_dtype = "float64"
+                
+            if isinstance(expected, pd.DataFrame):
+                # For DataFrames, convert each column
+                expected = pd.DataFrame({
+                    col: pd.Series(
+                        expected[col].to_numpy(dtype=numpy_dtype),
+                        index=expected.index,
+                        dtype=target_dtype
+                    ) for col in expected.columns
+                })
+            else:
+                # For Series
+                expected = pd.Series(
+                    pointwise_result.to_numpy(dtype=numpy_dtype),
+                    index=pointwise_result.index,
+                    dtype=target_dtype
+                )
+        elif "floordiv" in op_name and sdtype.name.startswith("Float"):
+            # Floor division of floats should preserve the float type
+            target_dtype = sdtype.name  # Keep same precision (Float32 or Float64)
+            numpy_dtype = "float32" if "32" in sdtype.name else "float64"
+            
+            if isinstance(expected, pd.DataFrame):
+                expected = pd.DataFrame({
+                    col: pd.Series(
+                        expected[col].to_numpy(dtype=numpy_dtype),
+                        index=expected.index,
+                        dtype=target_dtype
+                    ) for col in expected.columns
+                })
+            else:
+                expected = pd.Series(
+                    pointwise_result.to_numpy(dtype=numpy_dtype),
+                    index=pointwise_result.index,
+                    dtype=target_dtype
+                )
+        
         return expected
 
     def test_divmod_series_array(self, data, data_for_twos, request):
